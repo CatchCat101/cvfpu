@@ -7,3 +7,6 @@
 [submodule "tb/flexfloat"]
 	path = tb/flexfloat
 	url = https://github.com/oprecomp/flexfloat.git
+[submodule "tb/berkeley-softfloat-3"]
+	path = tb/berkeley-softfloat-3
+	url = https://github.com/ucb-bar/berkeley-softfloat-3.git

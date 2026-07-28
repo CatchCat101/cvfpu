@@ -2,6 +2,12 @@
 
 FPnew is a parametric floating-point unit which supports standard RISC-V operations as well as transprecision formats, written in SystemVerilog.
 
+Detailed block specifications:
+
+- [Single-format parallel FMA microarchitecture specification](fpnew_fma_spec.md)
+- [FMA dual-path significand add/subtract design trade-offs](fma_设计权衡.md)
+- [FP16/FP32/FP64 single-format FMA UVM verification plan](fpnew_fma_verification_plan.md)
+
 **Table of Contents**
 - [Top-Level Interface](#top-level-interface)
   - [Parameters](#parameters)

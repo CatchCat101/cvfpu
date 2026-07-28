@@ -1,0 +1,2 @@
+-f tb/fma_uvm/files/rtl.f
+-f tb/fma_uvm/files/tb.f

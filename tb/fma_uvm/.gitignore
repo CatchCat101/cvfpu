@@ -1,0 +1,12 @@
+build/
+runs/
+reports/
+csrc/
+simv*
+ucli.key
+vc_hdrs.h
+*.vdb/
+*.log
+*.fsdb
+__pycache__/
+*.pyc

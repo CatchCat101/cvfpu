@@ -2,7 +2,7 @@
 
 ## 1. 文档目的与适用范围
 
-本文档规定 FPnew `ADDMUL` 操作组中单格式并行 FMA 单元的功能、接口、位宽、组合数据通路、特殊值处理、规格化、舍入、状态标志和弹性流水线行为。目标是使实现者仅依据本文档即可重新编码出与当前 `fpnew_fma` RTL 数值行为和时序接口兼容的 SystemVerilog 模块。
+本文档规定 FPnew `ADDMUL` 操作组中单格式并行 FMA 单元的功能、接口、位宽、组合数据通路、特殊值处理、规格化、舍入、状态标志和弹性流水线行为。
 
 本文档对应以下实现：
 
@@ -10,15 +10,6 @@
 - 输入分类：[`../src/fpnew_classifier.sv`](../src/fpnew_classifier.sv)
 - 舍入单元：[`../src/fpnew_rounding.sv`](../src/fpnew_rounding.sv)
 - 公共类型及格式定义：[`../src/fpnew_pkg.sv`](../src/fpnew_pkg.sv)
-
-本文档只规定 `PARALLEL` 路径中的单格式 FMA。所有有效浮点操作数和结果都使用同一个参数化格式 `FpFormat`。混合源/目标格式 FMA、格式间指数重偏置和 super-format 数据通路属于 `fpnew_fma_multi`，不在本文档范围内。
-
-本文档使用以下规范用语：
-
-- “必须”：为获得兼容行为所必需。
-- “应”：强烈建议遵守；偏离时必须证明接口和数值行为等价。
-- “可以”：不影响规定行为的实现选择。
-- “未定义”：调用方不得依赖其值，实现可以输出任意值或综合无关值。
 
 ## 2. 功能概述
 
@@ -41,6 +32,17 @@ R = round_once(A' * B' + C')
 - 可配置数量和位置的弹性流水寄存器；
 - tag、mask 和 aux 旁带信息透传；
 - valid/ready 反压和同步 flush。
+
+### 2.1 总体架构图
+
+下图展示输入处理、特殊值旁路、常规数值通路、三个可选流水区以及最终
+result/status 选择之间的关系。灰色虚线框表示寄存器数量可以为零，其实际
+分配由 `NumPipeRegs` 和 `PipeConfig` 决定。
+
+![FPnew 单格式并行 FMA 总体架构](fig/fpnew_fma_arch_overview.svg)
+
+可编辑源文件：[`fpnew_fma_arch.drawio`](fig/fpnew_fma_arch.drawio)。源文件还包含对阶/加减和
+规格化/舍入两页详图。
 
 ## 3. 浮点格式模型
 
@@ -89,18 +91,16 @@ zero:      M = 0
 ```text
 normal:    e = E - BIAS
 subnormal: e = 1 - BIAS
-zero:      数学值为零，内部指数按后文的专用规则赋值
+zero:      数学值为零，偏置指数为0，但运算中间指数按后文的专用规则赋值
 ```
-问题：这里零的内部指数是零；而真实指数值不确定
 
 有限非零数的数学值为：
 
 ```text
 value = (-1)^sign * M * 2^(e-(p-1))
 ```
-问题：这里的指数为什么不是 e 呢？
 
-$ value = (-1)^{sign} \times M \times 2^{e}$
+$ value = (-1)^{sign} \times M \times 2^{e-(p-1)} $
 
 ### 3.3 参数约束
 
@@ -143,197 +143,27 @@ $ value = (-1)^{sign} \times M \times 2^{e}$
 实现必须使用下列常量关系：
 
 ```text
+// 加上隐含位
 PRECISION_BITS    = MAN_BITS + 1
+// | 1位加法运算可能的进位carry | 2p位乘积尾数 | 2位G/R |
 LOWER_SUM_WIDTH   = 2*PRECISION_BITS + 3
+// 前导0计数器的取值范围：[ 0 ... LOWER_SUM_WIDTH-1 ]，
+// LOWER_SUM_WIDTH全为0时，LZC单独有信号指示，故只需对LOWER_SUM_WIDTH取对数
 LZC_RESULT_WIDTH  = ceil(log2(LOWER_SUM_WIDTH))
-EXP_WIDTH         = max(EXP_BITS + 2, LZC_RESULT_WIDTH)
+// 1. 两个 EXP_BITS 位指数相加，需要增加一位；
+// 2. 减去 BIAS 或计算指数差后，结果可能为负，需要符号位。
+EXP_WIDTH         = EXP_BITS + 2
+// 加数C的最大移位量为3p+4，故取对数时需对3p+5取对数
 SHIFT_AMOUNT_WIDTH= ceil(log2(3*PRECISION_BITS + 5))
+// 保存普通加法结果或减法后的绝对值；
+// | 加数C的p位尾数 | 2位G/R | 乘积尾数2p位 | 2位G/R |
 SUM_WIDTH         = 3*PRECISION_BITS + 4
+// 观察减法 carry/borrow，并据此选择差值绝对值和最终符号
+// 或保存大规格化左移后可能到达 sum_shifted[SUM_WIDTH] 的最高非零位
+// 最终 `sum` 仍只保留低 `SUM_WIDTH` 位；额外最高位属于控制和规格化信息，
+// 不属于最终有效数字段
 ADDER_WIDTH       = SUM_WIDTH + 1
 ```
-
-其中：
-
-- `EXP_WIDTH` 的信号必须按二进制补码有符号数解释；
-- `SHIFT_AMOUNT_WIDTH` 的信号必须按无符号数解释；
-- `SUM_WIDTH` 是 `product_shifted`、`addend_after_shift`、`addend_shifted` 和 `sum` 的宽度；
-- `ADDER_WIDTH` 是 `sum_pos`、`sum_neg` 和 `sum_shifted` 的宽度。
-
-以下说明使用 `p=PRECISION_BITS`，并将 `SUM_WIDTH` 位的定点向量称为“对齐有效数加减域”。它是将完整乘积与 C 对阶后执行加减的公共位坐标，不是最终浮点结果的尾数字段。
-
-#### 4.2.1 `PRECISION_BITS`
-
-浮点编码只保存 `MAN_BITS` 位小数字段（fraction）。正规数还有一个未存储的隐含最高位 `1`，子正规数在同一位置使用 `0`：
-
-```text
-正规数有效数:   {1'b1, fraction}
-子正规数有效数: {1'b0, fraction}
-```
-
-所以参与乘法和加法的完整有效数宽度为：
-
-```text
-PRECISION_BITS = MAN_BITS + 1 = p
-```
-
-#### 4.2.2 `SUM_WIDTH` 以及高端 `p+2` 位的来源
-
-两个 `p` 位有效数相乘产生未经截断的 `2p` 位乘积。乘积在对齐有效数加减域中左移 2 位：
-
-```text
-| p+2 个高端空位 | 2p 位 product | 2 个低端精度预留位 |
-```
-
-因此：
-
-```text
-SUM_WIDTH = (p+2) + 2p + 2 = 3p+4
-```
-
-最低两位来自 `product << 2`，用于保留对阶和规格化后形成舍入判定位与粘滞信息（round/sticky）所需的低端精度。高端 `p+2` 位不是“C 的 `p` 位加两个与最低两位相同的舍入位”。它由 C 即将成为对阶指数基准时的极限布局决定。
-
-当：
-
-```text
-exponent_difference = p+2
-```
-
-中间区域公式给出：
-
-```text
-addend_shamt = p+3-(p+2) = 1
-```
-
-此时 `SUM_WIDTH` 位域的布局为：
-
-```text
-bit  3p+3 | 3p+2 ........ 2p+3 | 2p+2 | 2p+1 ...... 2 | 1:0
-           |                       |       |               |
-   规格化最高位预留位置   C 的 p 位有效数    C 下方   2p 位 product   低端精度位
-                                           精度位
-```
-
-所以 product 上方的 `p+2` 位可按该边界布局理解为：
-
-```text
-p+2 = 1 位规格化最高位预留位置 + p 位 C 有效数 + 1 位 C 下方低端精度位置
-```
-
-其中 C 下方的低端位置在 C 决定结果量级时充当首个舍入判定位置（round/guard），更低的乘积位汇入粘滞信息（sticky）。最高的一位为后续一位规格化调整预留位置；它不是加减器的 `sum_carry`。真正的进位/借位观察位由 `ADDER_WIDTH` 额外提供。
-
-当指数差减小时，C 在此固定宽度域中向低位移动并与 `product` 重叠；当指数差大于 `p+2` 时，C 成为对阶指数基准，`product` 只影响低位精度和粘滞信息。
-
-#### 4.2.3 `LOWER_SUM_WIDTH` 与 `LZC_RESULT_WIDTH`
-
-`product` 为 `2p` 位，左移 2 位后最高可能位于 `sum[2p+1]`。与已对阶的 C 相加时还可能在其上方形成一位，因此 product-anchored 和有效数抵消路径需要检查：
-
-```text
-sum[2p+2:0]
-```
-
-该区域宽度为：
-
-```text
-LOWER_SUM_WIDTH = 2p+3
-```
-
-当 C 明显决定结果量级时，规格化位置由 `addend_shamt` 决定，不需要对更高的 C 所在区域执行前导零计数。只对低 `2p+3` 位使用 LZC 可以缩短前导零计数器的数据通路。
-
-非零输入的前导零数量范围是：
-
-```text
-0 ... LOWER_SUM_WIDTH-1
-```
-
-全零情况由独立的 `lzc_zeroes` 信号表示，所以计数输出只需：
-
-```text
-LZC_RESULT_WIDTH = ceil(log2(LOWER_SUM_WIDTH))
-```
-
-#### 4.2.4 `EXP_WIDTH` 以及 LZC 大于乘积指数的情况
-
-内部指数不仅保存原始 exponent，还要计算：
-
-```text
-exponent_product    = exponent_a + exponent_b - BIAS
-exponent_difference = exponent_addend - exponent_product
-normalized_exponent = exponent_product - leading_zero_count + 1
-```
-
-`EXP_BITS+2` 提供一个符号位和一个指数相加的增长位，使负指数差、低于最小正规数的中间指数以及两个原始 exponent 相加后的值都不会发生截断。`LZC_RESULT_WIDTH` 则保证指数规格化判断能够处理与前导零计数相同量级的修正。因此参考 RTL 取：
-
-```text
-EXP_WIDTH = max(EXP_BITS+2, LZC_RESULT_WIDTH)
-```
-
-`leading_zero_count` 与 `exponent_product` 没有前者必须较小的关系：前者是 `sum_lower` 固定位坐标中的零数量，后者是带偏置的乘积指数基准。由于 `sum_lower` 在 `product` 最高位以上本来就有结构性空位，没有抵消时 LZC 通常也为 1 或 2；而接近下溢边界时 `exponent_product` 可能只有 1、0 或负值。发生近似相等数相减时，抵消还会令 LZC 显著增加。
-
-例如 FP32 中：
-
-```text
-A = 2^-126                         // 最小正规数
-B = 1.0
-C = -(2^-126 - 2^-149)            // 最大子正规数取负
-```
-
-精确结果为 `2^-149`，即最小子正规数。此时：
-
-```text
-p                  = 24
-exponent_product   = 1
-product_shifted    = 2^48
-addend_after_shift = 2^48 - 2^25
-sum                = 2^25
-leading_zero_count = 25            // 在 sum_lower[50:0] 中计数
-```
-
-RTL 实际判断的是：
-
-```text
-exponent_product - leading_zero_count + 1 >= 0
-```
-
-而不是简单比较 `leading_zero_count <= exponent_product`。若该表达式为负，完全消除前导零会要求负的带偏置指数（biased exponent），结果必须进入子正规数/零路径：
-
-```text
-normalized_exponent = 0
-norm_shamt = p+2+exponent_product
-```
-
-这会把左移量限制在最小指数边界，未能消除的前导零保留在最终 fraction 中。`leading_zero_count` 转成有符号值时必须先补一个零符号位，避免将其最高有效位误解释为负号。
-
-#### 4.2.5 `SHIFT_AMOUNT_WIDTH`
-
-`addend_shamt` 和 `norm_shamt` 都是无符号左/右移量，最大合法值为整个 `SUM_WIDTH`：
-
-```text
-maximum shift amount = 3p+4
-```
-
-需要编码包含零在内的 `0 ... 3p+4`，共 `3p+5` 个值，因此：
-
-```text
-SHIFT_AMOUNT_WIDTH = ceil(log2(3p+5))
-```
-
-这里的 `+5` 表示移位量可取值的数量，不表示数据通路额外增加 5 位。
-
-#### 4.2.6 `ADDER_WIDTH`
-
-乘积和 C 在 `SUM_WIDTH` 位域中对阶，但加减器必须额外保留一个最高位：
-
-```text
-ADDER_WIDTH = SUM_WIDTH+1
-```
-
-该位用于：
-
-- 在补码减法中通过 `sum_carry` 判断 `|A*B|` 与 `|C|` 的大小；
-- 保留加减法临时进位/借位；
-- 在规格化移位后检测结果是否进入额外最高位，并据此右移一位、指数加一。
-
-最终 `sum` 仍只保留低 `SUM_WIDTH` 位；额外最高位属于控制和规格化信息，不属于最终有效数字段。
 
 ### 4.3 流水线寄存器分配
 
@@ -546,7 +376,7 @@ info_c 其他字段= 0
 - RDN 下通过 `product + (+0)` 配合精确零规则产生正确符号；
 - 其他舍入模式下通过 `product + (-0)` 保持乘积零的符号。
 
-接口契约只定义 `MUL/op_mod=0`。当前数据通路会在 MUL 分支覆盖 C，因此 `op_mod=1` 对结果没有实际影响，但调用方不应依赖未定义组合。
+接口契约只定义 `MUL/op_mod=0`。当前数据通路会在 MUL 分支根据舍入模式将 C设置为正零或负零， `op_mod=1` 对结果没有实际影响，但调用方不应依赖未定义组合。
 
 ### 7.5 非法操作码
 
@@ -590,6 +420,21 @@ fraction = 1 << (MAN_BITS-1)
 ### 9.2 优先级
 
 特殊值判断必须严格使用下列从高到低的优先级。
+
+该优先级不是为了任意选择一个“先匹配”的条件，也不只是为了避免多个条件同时驱动结果。它是浮点体系结构对重叠特殊值组合所规定语义的硬件化表达。FMA 是一次不可分割的浮点运算，同一组输入可能同时满足“乘数构成无穷乘零”“某个输入为 NaN”和“某个输入为无穷”等多个分类条件；实现必须按照体系结构规定，为整个输入组合确定唯一的结果和状态标志。
+
+尤其是，[RISC-V F 扩展](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)明确规定：融合乘加的两个乘数分别为无穷和零时必须置位 invalid operation，即使加数是 quiet NaN。因此，本模块必须让“无穷乘零”先于通常的 NaN 传播规则。RISC-V 默认采用 canonical NaN，本模块也因此输出固定的 canonical qNaN，而不传播输入 NaN 的 payload 或符号。
+
+优先级不能任意交换。下列重叠组合说明了各层顺序的必要性：
+
+| 重叠输入组合 | 必须采用的分支 | 结果 | `NV` | 若错误地采用较低优先级 |
+|---|---|---|---:|---|
+| `Inf * 0 + qNaN` | 无穷乘零 | canonical qNaN | 1 | 若先按 qNaN 处理，会错误地得到 `NV=0` |
+| 任一有效输入为 sNaN，同时另一输入为无穷 | NaN | canonical qNaN | 1 | 若先传播无穷，会错误地输出无穷并丢失 `NV` |
+| 任一有效输入为 qNaN，同时另一输入为无穷 | NaN | canonical qNaN | 0 | 若先传播无穷，会错误地输出无穷 |
+| 无穷乘积与反号无穷 C 相加 | 无穷分支中的无效无穷抵消 | canonical qNaN | 1 | 若按普通无穷传播，会错误地输出无穷且不置 `NV` |
+
+这里的“有效输入”是指经过第 7 章操作选择和操作数改写后仍参与当前操作的输入。例如，`ADD/ADDS` 已用 `+1.0` 替换 A，原始 A 的 NaN、无穷和 NaN-boxing 错误都不得参与本节判断；`MUL` 已用规定符号的零替换 C，原始 C 的特殊值同样不得参与判断。
 
 #### 优先级 1：无穷乘零
 
@@ -666,11 +511,55 @@ fraction = 0
 status   = 0
 ```
 
-### 9.3 旁路要求
+### 9.3 `NV` 的完整置位规则
+
+`NV` 表示 IEEE 754 invalid operation。它必须按照与第 9.2 节完全相同的优先级计算，而不能把各个候选条件简单地做逻辑 OR：
+
+```text
+if 无穷乘零:
+    NV = 1
+else if any_operand_nan:
+    NV = signalling_nan
+else if 无穷乘积与无穷 C 构成有效减法:
+    NV = 1
+else:
+    NV = 0
+```
+
+不能简单 OR 的原因是：若存在 qNaN，同时由其余操作数的无穷分类和符号使第三层的无穷抵消候选条件也为真，NaN 分支仍必须先产生 canonical qNaN 且保持 `NV=0`；只有不存在任何 NaN、实际进入无穷处理分支时，无穷抵消条件才置位 `NV`。
+
+因此，本模块中特殊值路径置位 `NV` 的情况只有：
+
+1. 改写后的 A、B 构成 `Inf * 0` 或 `0 * Inf`；
+2. 未命中上一条，并且任一改写后仍有效的操作数为 signalling NaN；
+3. 未命中前两条，并且 A 或 B 使乘积为无穷、C 也为无穷，且乘积符号与 C 的符号相反。
+
+
+### 9.4 RTL 中处理顺序的表达
+
+本节存在两种不同的“顺序”，编码时必须分别表达：
+
+1. **数据流顺序由信号依赖表达。** 原始操作数先由分类器产生 `info_q`；操作选择逻辑读取原始操作数和 `info_q`，产生改写后的 `operand_a/b/c` 和 `info_a/b/c`；派生控制信号及特殊值处理逻辑只能读取这些改写后的信号。其组合依赖关系为：
+
+   ```text
+   原始操作数/is_boxed
+       -> 分类器 info_q
+       -> 操作选择与操作数/分类改写
+       -> operand_a/b/c、info_a/b/c
+       -> 特殊值条件
+       -> special_result、special_status、result_is_special
+   ```
+
+### 9.5 旁路要求
 
 特殊值事务仍必须携带正确的 tag、mask、aux 和流水线 valid。常规有限数数据通路可以同时组合计算，但最终结果和状态必须由 `result_is_special` 选择特殊路径。
 
 ## 10. 常规路径：初始指数
+
+下图将第 10～13 章中的指数计算、乘积布局、C 的对阶、sticky 生成、双路加法器、
+绝对值与符号选择及内部流水切分点连成完整数据流。
+
+![FPnew 单格式 FMA 指数、对阶与双路尾数加减](fig/fpnew_fma_arch_align_add.svg)
 
 ### 10.1 有符号容器
 
@@ -839,7 +728,7 @@ sum_neg = zero_extend(addend_after_shift, ADDER_WIDTH)
         - zero_extend(product_shifted, ADDER_WIDTH)
 ```
 
-`sum_pos` 在有效加法时表示 `|A*B|+|C|`；在有效减法时，其低 `SUM_WIDTH` 位表示 `|A*B|-|C|` 的补码结果，`sum_carry` 用于判断大小关系。
+`sum_pos` 在有效加法时表示 `|A*B|+|C|`；在有效减法时，其低 `SUM_WIDTH` 位表示 `|A*B|-|C|` 的补码结果，`sum_carry` 用于判断大小关系，若`sum_carry = 1`，则乘积尾数`不小于`加数尾数；若`sum_carry = 0`，则乘积尾数`小于`加数尾数。
 
 ### 12.3 绝对值选择
 
@@ -856,15 +745,17 @@ else:
 - `sum_carry==0` 表示 C 的绝对值更大，此时选择 `C-product`；
 - 相等时按 `sum_carry==1` 路径产生精确零。
 
-有效加法不应溢出 `SUM_WIDTH` 的有效范围，额外 carry 位只用于统一宽度和减法大小判断。
+有效加法不应溢出 `SUM_WIDTH` 的有效范围，额外 carry 位只用于减法大小判断。
 
 ### 12.4 最终未舍入符号
 
 必须实现与下式等价的逻辑：
 
 ```text
+// addition occurs
 if !effective_subtraction:
     final_sign = tentative_sign
+// substraction occurs
 else if sum_carry == tentative_sign:
     final_sign = 1
 else:
@@ -874,8 +765,8 @@ else:
 在有效减法情况下，也可理解为：
 
 ```text
-sum_carry==1: final_sign = tentative_sign
-sum_carry==0: final_sign = !tentative_sign
+sum_carry==1, product is bigger: final_sign = tentative_sign
+sum_carry==0, addend is bigger: final_sign = !tentative_sign
 ```
 
 精确零时该符号只是暂定值；最终舍入模块必须按第 15.4 节修正零符号。
@@ -910,6 +801,12 @@ valid
 若 `NUM_MID_REGS==0`，以上信号直接组合连接到规格化路径。若大于零，则按第 18 节的统一弹性流水规则传递。
 
 ## 14. 规格化
+
+下图将第 14～17 章中的 LZC、规格化移位量、大移位与小规格化、`R/S/T`、
+`fpnew_rounding`、OF/UF/NX 生成及 special/regular 结果选择连成完整数据流。图的下半部
+单独展开了从 subnormal 舍入到最小 normal 时的 tininess-after-rounding 判断。
+
+![FPnew 单格式 FMA 规格化、舍入与状态位](fig/fpnew_fma_arch_norm_round.svg)
 
 ### 14.1 前导零检测输入
 
@@ -1099,7 +996,7 @@ RS            = {round_bit, sticky_bit}
 
 `pre_round_abs` 宽度为 `EXP_BITS+MAN_BITS`，不包含 sign 和隐含位。
 
-### 15.2 舍入增量
+### 15.2 舍入模式与舍入增量
 
 定义保留结果最低位：
 
@@ -1107,6 +1004,20 @@ RS            = {round_bit, sticky_bit}
 LSB = pre_round_abs[0]
 inexact_remainder = round_bit || sticky_bit
 ```
+
+`LSB` 是 Least Significant Bit，即保留结果的最低位。`RS` 中的 R 是 round bit，S 是 sticky bit。本节使用的舍入模式缩写和编码如下：
+
+| 编码 | 缩写 | 英文原文 | 含义 |
+|---:|---|---|---|
+| `000` | RNE | Round to Nearest, ties to Even | 舍入到最近的可表示值；恰好位于两个可表示值中间时，选择保留结果 LSB 为 `0` 的值 |
+| `001` | RTZ | Round Toward Zero | 向零方向舍入，直接丢弃未保留位 |
+| `010` | RDN | Round Down, toward Negative Infinity | 向负无穷方向舍入 |
+| `011` | RUP | Round Up, toward Positive Infinity | 向正无穷方向舍入 |
+| `100` | RMM | Round to Nearest, ties to Maximum Magnitude | 舍入到最近的可表示值；恰好居中时，选择绝对值较大的值，即远离零 |
+| `101` | ROD | Round to Odd | 如果被舍弃部分非零，则使保留结果的 LSB 为 `1`；该模式是本仓库的扩展，`fpnew_pkg` 明确标注其不属于 RISC-V FP-SPEC 定义的舍入模式 |
+| `111` | DYN | Dynamic Rounding Mode | 动态舍入模式编码，它不是具体舍入算法；调用方必须在进入本单元前将其解析为其他合法静态模式 |
+
+`round_up` 表示是否对不包含 sign 的 `pre_round_abs` 加 `1`，即增加一个当前保留精度的 ulp（unit in the last place）。它不能一律理解为浮点数值向正方向增大：对负数而言，绝对值加 `1` 使结果更负。
 
 `round_up` 必须按下表产生：
 
@@ -1177,7 +1088,138 @@ of_after_round = (rounded_exp == all_ones)
 
 ### 16.3 舍入后 underflow 判定
 
-为与参考 RTL 在 subnormal/最小 normal 边界处保持一致，必须使用以下完整表达式，而不能只判断舍入后 exponent 是否为零：
+本模块采用 tininess-after-rounding（舍入后微小性检查）生成
+underflow 状态。该检查不能简化为“最终结果是 subnormal 时才是
+tiny”，因为在最大 subnormal 与最小 normal 之间，一个按 `p` 位有效
+数字舍入后仍然小于最小 normal 的结果，可能通过实际 subnormal 的按`p-1`位有效数字舍入进位而得到最小 normal 编码。
+
+#### 16.3.1 舍入后微小性检查的对象
+
+设精确数学结果为 `x`，`p = MAN_BITS+1`。舍入后微小性检查按以下顺序
+理解：
+
+1. 暂时允许 exponent 小于 `emin`；
+2. 使用当前 `rnd_mode`，将 `x` 按 normal 的 `p` 位有效数字舍入；
+3. 检查上述 `p` 位舍入结果是否仍严格小于最小 normal：
+
+```text
+minimum_normal = 1.000...000 * 2^emin
+```
+
+若非零的 `p` 位舍入结果仍小于 `minimum_normal`，则结果是 tiny。
+
+暂时允许 exponent 小于 `emin` 的目的，是在判断 tiny 前仍然保留 normal
+的 `p` 位有效数字。如果先把 exponent 限制在目标格式的取值范围内，小于
+最小 normal 的数只能使用 subnormal 编码；在此边界上只能保留 fraction
+中的 `p-1` 位有效数字，原本的第 `p` 位有效数字会被当成 round bit。
+这种 subnormal 舍入可能进位到最小 normal，从而使最终编码无法单独说明
+按 `p` 位有效数字舍入后的结果是否仍然 tiny。
+
+`rounded_abs` 仍然是按目标格式生成的正确最终结果。上述 exponent 不受下限
+约束的假设只用于微小性检查，不用于生成输出编码。RTL 也不需要真正执行
+第二次舍入，而是通过 `R`、`S`、`T` 和 `rnd_mode` 直接得到等价的判断结果。
+
+#### 16.3.2 `R`、`S` 和 `T`
+
+```text
+R = round_sticky_bits[1] = final_mantissa[0]
+S = round_sticky_bits[0] = sticky_after_norm
+T = sum_sticky_bits[2*MAN_BITS + 4]
+```
+
+`sum_sticky_bits[2*MAN_BITS+4]` 是 `sum_sticky_bits` 的最高位，因为：
+
+```text
+width(sum_sticky_bits) = 2p+3 = 2*MAN_BITS+5
+```
+
+`T` 是紧接在 `R` 之后的位；`S` 则是 `T`、`T` 之后的所有位以及
+`sticky_before_add_q` 的 OR 结果：
+
+```text
+S = T
+  | OR(sum_sticky_bits[2*MAN_BITS+3 : 0])
+  | sticky_before_add_q
+```
+
+#### 16.3.3 舍入后 exponent 仍为零
+
+```text
+rounded_exp == 0
+```
+
+最终编码为 zero 或 subnormal。RTL 在此情形下直接置位 `uf_after_round`。
+最终 `UF` 还要与 `NX` 相与，因此：
+
+- 不精确舍入得到的 zero 或 subnormal 置位 `UF`；
+- 精确 zero 和精确 subnormal 的 `NX=0`，不置位 `UF`。
+
+#### 16.3.4 从 subnormal 进位到最小 normal
+
+边界情形为：
+
+```text
+(pre_exp == 0) && (rounded_exp == 1)
+```
+
+由于 `rounded_abs = pre_round_abs + round_up`，exponent 从零变为一意味着
+`pre_round_mantissa` 全为 `1` 且 `round_up=1`。因此最终结果正好是最小
+normal。但该进位仅由实际 subnormal 舍入使用 `p-1` 位有效数字所导致，
+所以还需要判断按 `p` 位有效数字舍入时能否产生同样的进位。
+
+在实际 subnormal 舍入中，位序列可写为：
+
+```text
+ 0.[p-1 位全 1] | R | T lower...  * 2^emin
+```
+
+暂时允许 exponent 小于 `emin` 并将该序列左移一位：
+
+```text
+ 1.[p-2 位全 1] R | T | lower... * 2^(emin-1)
+```
+
+此时原来的 `R` 成为第 `p` 位有效数字，原来的 `T` 成为新的 round bit。
+然后根据当前 `rnd_mode` 判断这 `p` 位有效数字能否进位：
+
+- 若舍入使全 `1` 的 `p` 位有效数字进位为
+  `10.000...000 * 2^(emin-1) = 1.000...000 * 2^emin`，则不 tiny；
+- 若不产生该进位，结果仍为 `1.xxx...xxx * 2^(emin-1)`，严格小于
+  最小 normal，因此仍然 tiny。
+
+边界情形中的判断式为：
+
+```text
+boundary_is_tiny =
+    (RS != 2'b11)
+    || (!T && (rnd_mode == RNE || rnd_mode == RMM))
+```
+
+各项条件的原因如下：
+
+- `RS=00`：在 `pre_exp==0 && rounded_exp==1` 的前提下实际不可达，因为没有需要
+  舍入的非零位，`round_up` 不可能为一。`RS!=11` 在布尔表达式中对它的
+  覆盖不影响可达输入的结果；
+- `RS=01`：左移后的第 `p` 位有效数字 `R` 为零。即使舍入加一，也只会
+  将该位从零变为一，不会使整个 `p` 位尾数进位，因此 tiny；
+- `RS=10`：左移后保留的 `p` 位全为一，但 `S=0` 说明 `T` 和之后的所有位
+  均为零。这个 `p` 位结果是精确的，不会加一，因此 tiny；
+- `RS=11`：左移后保留的 `p` 位全为一，并且其后存在非零位。对于
+  RNE 和 RMM，`T` 是新的 round bit：
+  - `T=0` 表示小于半个 `p` 位结果的 ulp，不加一，因此 tiny；
+  - `T=1` 表示恰好等于或大于半个 ulp。RNE 在恰好一半时因保留结果的
+    LSB（即 `R`）为一而加一，RMM 也加一；全一结果因此产生进位，
+    结果达到最小 normal，不 tiny。
+
+对于 RUP 或 RDN，只有向绝对值增大的方向舍入才能使该边界情形的
+`rounded_exp` 从零变为一。当 `RS=11` 时，该舍入同样会对左移后的全一
+`p` 位结果加一，所以不 tiny。RTZ 不加一；ROD 在
+`pre_round_mantissa` 全一时也不加一，因此它们不会进入该 exponent 从零变为一
+的边界情形。
+
+#### 16.3.5 RTL 表达式
+
+完整实现必须使用以下表达式，而不能只判断舍入后 exponent 是否为零：
 
 ```text
 uf_after_round =
@@ -1198,14 +1240,6 @@ uf_after_round =
     )
 ```
 
-`sum_sticky_bits[2*MAN_BITS+4]` 正好是 `sum_sticky_bits` 的最高位，因为：
-
-```text
-width(sum_sticky_bits) = 2p+3 = 2*MAN_BITS+5
-```
-
-该边界逻辑用于识别未受限结果处于最小 normal 阈值以下、但舍入编码恰好进位到最小 normal 的情形。
-
 ### 16.4 常规路径状态
 
 状态位必须按下式生成：
@@ -1223,7 +1257,7 @@ regular_status.UF = uf_after_round && regular_status.NX
 要求：
 
 - FMA 永远不置 `DZ`；
-- 精确 subnormal 可以不置 `UF`，因为 `UF` 必须与 `NX` 同时成立；
+- 精确 zero 和精确 subnormal 不置 `UF`，因为 `UF` 必须与 `NX` 同时成立；
 - overflow 必须同时置 `OF` 和 `NX`；
 - 常规有限路径不置 `NV`。
 
@@ -1467,240 +1501,7 @@ early_out_valid_o =
 early_out_valid_o = 0
 ```
 
-## 20. 组合数据通路伪代码
-
-以下伪代码汇总数值核心。它不包含第 18 节的寄存器数组，但信号必须在规定切分点随 valid 一起流水。
-
-```text
-class_a, class_b, class_c = classify(raw_a, raw_b, raw_c, is_boxed)
-
-a = raw_a
-b = raw_b
-c = raw_c
-c.sign ^= op_mod
-
-case op:
-  FMADD:
-    no additional change
-  FNMSUB:
-    a.sign = !a.sign
-  ADD, ADDS:
-    a = +1.0
-    class_a = normal
-  MUL:
-    c = (rnd_mode == RDN) ? +0.0 : -0.0
-    class_c = zero
-  default:
-    undefined
-
-sp  = a.sign XOR b.sign
-sub = sp XOR c.sign
-
-special_result, special_status, is_special = special_case_tree(...)
-
-ea = zero_extend_signed(a.exponent)
-eb = zero_extend_signed(b.exponent)
-ec = zero_extend_signed(c.exponent)
-
-eadd = ec + !class_c.is_normal
-eprod = (class_a.is_zero || class_b.is_zero)
-      ? 2-BIAS
-      : ea + class_a.is_subnormal
-           + eb + class_b.is_subnormal - BIAS
-ediff = eadd-eprod
-etent = (ediff > 0) ? eadd : eprod
-
-ma = {class_a.is_normal, a.fraction}
-mb = {class_b.is_normal, b.fraction}
-mc = {class_c.is_normal, c.fraction}
-
-product = ma*mb
-product_shifted = zero_extend(product) << 2
-
-addend_shamt = saturating_alignment_shift(ediff)
-addend_after_shift, shifted_out = align(mc, addend_shamt)
-sticky_before = OR(shifted_out)
-
-addend_shifted = sub ? NOT(addend_after_shift) : addend_after_shift
-carry_in = sub && !sticky_before
-
-sum_pos = product_shifted + addend_shifted + carry_in
-sum_neg = addend_after_shift - product_shifted
-carry   = MSB(sum_pos)
-sum     = (sub && !carry) ? low(sum_neg) : low(sum_pos)
-sign    = choose_sign(sub, carry, sp)
-
-// optional internal pipeline here
-
-lzc, empty = leading_zero_count(sum[2p+2:0])
-norm_shift, norm_exp = choose_normalization_shift(...)
-sum_shifted = zero_extend(sum) << norm_shift
-final_mantissa, sum_sticky_bits, final_exp = small_normalize(...)
-sticky = OR(sum_sticky_bits) || sticky_before
-
-pre_abs, RS, pre_sign, of_before = assemble_for_round(...)
-round_up = rounding_decision(pre_abs[0], RS, pre_sign, rnd_mode)
-rounded_abs = pre_abs + round_up
-rounded_sign = fix_exact_zero_sign(...)
-
-regular_result = {rounded_sign, rounded_abs}
-regular_status = classify_status(...)
-
-result = is_special ? special_result : regular_result
-status = is_special ? special_status : regular_status
-```
-
-## 21. 必须保持的实现不变量
-
-重新编码 RTL 时必须保持以下不变量：
-
-1. 乘积以完整 `2p` 位进入加减法，乘法后不单独舍入。
-2. 对阶丢失位同时影响 sticky 和减法补码进位。
-3. `exponent_difference` 始终定义为“加数指数减乘积指数”。
-4. 有效减法必须能够在 `product-C` 与 `C-product` 之间选择正绝对值。
-5. 大抵消路径必须检查低 `2p+3` 位的前导零。
-6. 最终舍入仅执行一次。
-7. overflow 时必须通过“最大有限值 + RS=11”进入统一舍入器。
-8. underflow 必须使用第 16.3 节的最小 normal 边界表达式，并与 NX 相与。
-9. NaN 输出必须为 canonical qNaN，不传播 payload。
-10. `inf*0` 的 invalid 优先级高于 C 为 quiet NaN。
-11. 特殊结果只选择特殊状态，不与常规状态合并。
-12. tag、mask、aux 必须与结果保持事务级同步。
-13. 每个流水级必须能够独立停顿，不能只实现全流水统一 clock-enable。
-14. flush 必须清除所有实际 valid 寄存器。
-15. `extension_bit_o` 恒为 1。
-
-## 22. 验证要求
-
-### 22.1 基本操作
-
-每种受支持格式和每种合法舍入模式至少覆盖：
-
-- FMADD、FMSUB、FNMSUB、FNMADD；
-- ADD、SUB、ADDS；
-- MUL；
-- 正负操作数的所有符号组合；
-- 结果恰好可表示和不可精确表示两类。
-
-### 22.2 特殊值优先级
-
-必须定向验证：
-
-- `inf*0 + finite`；
-- `inf*0 + qNaN`，仍必须置 NV；
-- qNaN 与 sNaN；
-- 未 NaN-box 输入，产生 canonical qNaN 且不因 boxing 本身置 NV；
-- `+inf + -inf` 和 `-inf + +inf` 的有效减法；
-- 无穷乘积与同号无穷有效加法；
-- 有限乘积加正/负无穷；
-- ADD 忽略原始 A 的 NaN/Inf；
-- MUL 忽略原始 C 的 NaN/Inf。
-
-### 22.3 零和符号
-
-必须覆盖：
-
-- `+0 + +0`、`-0 + -0`、`+0 + -0`；
-- 精确抵消在 RDN 和非 RDN 模式下的零符号；
-- 正负零乘正负有限数；
-- MUL 在所有舍入模式下保持乘积零符号；
-- subnormal 相消为零。
-
-### 22.4 对阶、sticky 和抵消
-
-必须覆盖指数差边界：
-
-```text
-ediff = -(2p+1), -(2p), 0, 1, 2, p+2, p+3
-```
-
-并分别验证：
-
-- 移出位全零与存在 1；
-- 有效加法和有效减法；
-- `inject_carry_in` 在 sticky 变化时翻转；
-- C 极小但通过 sticky 改变最终舍入；
-- 乘积与 C 只差 1 ulp 或更小；
-- 严重抵消后结果为 normal、subnormal 和零。
-
-### 22.5 舍入和状态
-
-每种舍入模式必须覆盖 `{R,S}=00/01/10/11`，RNE 的 tie case 还要分别覆盖保留 LSB 为 0 和 1。
-
-必须覆盖：
-
-- 最大有限值附近向 infinity 或最大有限值舍入；
-- 正负 overflow 在 RDN/RUP 下的方向差异；
-- 精确 subnormal，不置 UF/NX；
-- 非精确 subnormal，同时置 UF/NX；
-- 最大 subnormal 舍入到最小 normal 的边界；
-- 最小 normal 邻域中第 16.3 节 underflow 附加条件；
-- ROD 使非精确结果最低位为 1。
-
-### 22.6 流水和握手
-
-至少对以下配置运行随机反压：
-
-- `NumPipeRegs=0, BEFORE`；
-- `NumPipeRegs=1, INSIDE`；
-- `NumPipeRegs=2, DISTRIBUTED`；
-- `NumPipeRegs=3, DISTRIBUTED`；
-- `NumPipeRegs>=2, BEFORE/INSIDE/AFTER`。
-
-检查：
-
-- 无反压时每周期一个事务；
-- 任意反压下不丢失、不重复、不重排本实例内事务；
-- 输出停顿时 payload 稳定；
-- tag、mask、aux 与数据对应；
-- flush 后所有在途 valid 消失；
-- reset 后 valid 和 busy 清零；
-- 各物理寄存器的 `reg_ena_i` 索引映射正确；
-- `early_out_valid_o` 按所选兼容语义验证。
-
-### 22.7 建议断言
-
-实现中建议加入或在验证环境绑定以下性质：
-
-```text
-out_valid && !out_ready |=> $stable({result,status,tag,mask,aux,out_valid})
-
-accepted_input_count - flushed_input_count - accepted_output_count
-    == number_of_valid_transactions_in_pipeline
-
-status.UF -> status.NX
-status.OF -> status.NX
-special_result_is_nan -> result == canonical_qNaN
-extension_bit_o == 1
-```
-
-对于 `reg_ena_i` 非零的测试，应对稳定性断言增加相应环境假设。
-
-## 23. RTL 编码检查清单
-
-编码完成后，设计评审必须逐项确认：
-
-- [ ] 所有指数临时量的 signed/unsigned 类型与第 10 节一致。
-- [ ] 所有可变移位的左操作数已显式扩展到规定宽度。
-- [ ] `product` 恰为 `2p` 位。
-- [ ] `product_shifted` 和 `sum` 恰为 `3p+4` 位。
-- [ ] `sum_pos`、`sum_neg`、`sum_shifted` 恰为 `3p+5` 位。
-- [ ] C 对阶临时域恰为 `4p+4` 位。
-- [ ] sticky 没有直接并入 addend LSB。
-- [ ] 减法 carry-in 使用 `sub && !sticky_before_add`。
-- [ ] 特殊值 if/else 优先级与第 9 节完全一致。
-- [ ] LZC 的 empty 输出参与 normal/subnormal 路径选择。
-- [ ] 小规格化判断顺序为 carry、主 MSB、可左移、subnormal。
-- [ ] 舍入前 overflow 使用最大有限值和 `RS=11`。
-- [ ] 精确零符号使用 effective subtraction 和 RDN。
-- [ ] UF 使用完整边界表达式并与 NX 相与。
-- [ ] 特殊路径状态覆盖而不是 OR 常规状态。
-- [ ] 三个流水区的 valid、ready 和 payload 规则一致。
-- [ ] `reg_ena_i` 只覆盖 payload enable。
-- [ ] 输出反压时所有事务字段稳定。
-- [ ] `extension_bit_o` 恒为 1。
-
-## 24. 与上层集成的约束
+## 21. 与上层集成的约束
 
 本模块通常由 `fpnew_opgroup_fmt_slice` 的一个 lane 实例化。上层必须保证：
 
@@ -1713,21 +1514,4 @@ extension_bit_o == 1
 - 若多个格式或操作组存在不同延迟，上层使用 tag 识别返回事务；
 - 单格式 `PARALLEL` 实例不用于 `src_fmt != dst_fmt` 的混合格式 FMA。
 
-## 25. 规格追踪表
 
-| 规格内容 | 参考 RTL 区域 |
-|---|---|
-| 参数和端口 | `fpnew_fma.sv` 模块声明 |
-| 流水线分配 | `fpnew_fma.sv` Constants/Pipelines |
-| 输入流水线 | `fpnew_fma.sv` Input pipeline |
-| 分类规则 | `fpnew_classifier.sv` Classify Input |
-| 操作译码 | `fpnew_fma.sv` Operation selection and operand adjustment |
-| 特殊值 | `fpnew_fma.sv` Special case handling |
-| 指数路径 | `fpnew_fma.sv` Initial exponent data path |
-| 乘积和对阶 | `fpnew_fma.sv` Product/Addend data path |
-| 加减和符号 | `fpnew_fma.sv` Adder |
-| 内部流水线 | `fpnew_fma.sv` Internal pipeline |
-| 规格化 | `fpnew_fma.sv` Normalization |
-| 舍入和标志 | `fpnew_fma.sv` Rounding and classification；`fpnew_rounding.sv` |
-| 输出流水线 | `fpnew_fma.sv` Output Pipeline |
-| 顶层 lane 集成 | `fpnew_opgroup_fmt_slice.sv` ADDMUL lane instance |

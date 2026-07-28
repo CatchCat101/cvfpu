@@ -1,0 +1,13 @@
+{
+  "name": "smoke",
+  "runs": [
+    {"cfg": "n0_before", "test": "fma_smoke_test", "seed": 1200, "num_txns": 0},
+    {"cfg": "n2_before", "test": "fma_smoke_test", "seed": 1201, "num_txns": 0},
+    {"cfg": "n2_inside", "test": "fma_smoke_test", "seed": 1202, "num_txns": 0},
+    {"cfg": "n2_after",  "test": "fma_smoke_test", "seed": 1203, "num_txns": 0},
+    {"cfg": "n1_dist",   "test": "fma_smoke_test", "seed": 1101, "num_txns": 0},
+    {"cfg": "n2_dist",   "test": "fma_smoke_test", "seed": 1102, "num_txns": 0},
+    {"cfg": "n3_dist",   "test": "fma_smoke_test", "seed": 1103, "num_txns": 0},
+    {"cfg": "n4_dist",   "test": "fma_smoke_test", "seed": 1104, "num_txns": 0}
+  ]
+}

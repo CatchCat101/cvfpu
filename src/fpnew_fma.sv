@@ -64,16 +64,23 @@ module fpnew_fma #(
   localparam int unsigned EXP_BITS = fpnew_pkg::exp_bits(FpFormat);
   localparam int unsigned MAN_BITS = fpnew_pkg::man_bits(FpFormat);
   localparam int unsigned BIAS     = fpnew_pkg::bias(FpFormat);
-  // Precision bits 'p' include the implicit bit
+  // Precision p includes the implicit leading bit of a normal significand.
   localparam int unsigned PRECISION_BITS = MAN_BITS + 1;
-  // The lower 2p+3 bits of the internal FMA result will be needed for leading-zero detection
+  // The aligned significand field is 3p+4 bits wide. At the addend-dominant boundary
+  // (exponent_difference == p+2), its layout can be read as:
+  // | normalization headroom | C[p] | C low-precision slot | product[2p] | low[2] |
+  // Only the lower 2p+3 bits can contain the leading one in product-anchored or cancellation
+  // cases; the upper C-dominant region is normalized from addend_shamt instead of an LZC.
   localparam int unsigned LOWER_SUM_WIDTH  = 2 * PRECISION_BITS + 3;
+  // A non-empty LZC result ranges from 0 to LOWER_SUM_WIDTH-1. The all-zero case has a
+  // separate empty indication, so clog2(LOWER_SUM_WIDTH) bits are sufficient.
   localparam int unsigned LZC_RESULT_WIDTH = $clog2(LOWER_SUM_WIDTH);
-  // Internal exponent width of FMA must accomodate all meaningful exponent values in order to avoid
-  // datapath leakage. This is either given by the exponent bits or the width of the LZC result.
-  // In most reasonable FP formats the internal exponent will be wider than the LZC result.
+  // EXP_BITS+2 provides signed headroom for exponent addition/subtraction. The LZC term keeps
+  // cancellation-driven normalization corrections from being truncated. The LZC may be larger
+  // than exponent_product near underflow; that signed comparison selects the subnormal path.
   localparam int unsigned EXP_WIDTH = unsigned'(fpnew_pkg::maximum(EXP_BITS + 2, LZC_RESULT_WIDTH));
-  // Shift amount width: maximum internal mantissa size is 3p+4 bits
+  // Alignment and normalization shifts range from 0 through 3p+4 inclusive. Encoding all
+  // 3p+5 values therefore requires clog2(3p+5) unsigned bits.
   localparam int unsigned SHIFT_AMOUNT_WIDTH = $clog2(3 * PRECISION_BITS + 5);
   // Pipelines
   localparam NUM_INP_REGS = PipeConfig == fpnew_pkg::BEFORE
@@ -337,7 +344,9 @@ module fpnew_fma #(
   // Mantissa multiplier (a*b)
   assign product = mantissa_a * mantissa_b;
 
-  // Product is placed into a 3p+4 bit wide vector, padded with 2 bits for round and sticky:
+  // Product is placed into the 3p+4 bit aligned-significand field. The p+2 upper positions let
+  // the p-bit C significand move above the product while retaining one lower precision slot and
+  // one upper normalization slot. The two low positions preserve later round/sticky precision:
   // | 000...000 | product | RS |
   //  <-  p+2  -> <-  2p -> < 2>
   assign product_shifted = product << 2; // constant shift
@@ -529,7 +538,10 @@ module fpnew_fma #(
   always_comb begin : norm_shift_amount
     // Product-anchored case or cancellations require LZC
     if ((exponent_difference_q <= 0) || (effective_subtraction_q && (exponent_difference_q <= 2))) begin
-      // Normal result (biased exponent > 0 and not a zero)
+      // LZC includes the fixed headroom above the product and can exceed exponent_product after
+      // deep cancellation or near underflow. A negative adjusted biased exponent is not wrapped;
+      // it selects the capped subnormal shift below.
+      // Normal result candidate (adjusted biased exponent >= 0 and not a zero)
       if ((exponent_product_q - leading_zero_count_sgn + 1 >= 0) && !lzc_zeroes) begin
         // Undo initial product shift, remove the counted zeroes
         norm_shamt          = PRECISION_BITS + 2 + leading_zero_count;
